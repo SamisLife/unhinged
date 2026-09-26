@@ -13,12 +13,29 @@
 // Angles are degrees from center. Targets are latest-wins; motion is speed and
 // acceleration limited so the rig never jumps.
 //
-// Arduino IDE: Board XIAO_ESP32S3, USB CDC On Boot: Enabled. No libraries.
-// Servos are driven with the ESP32's LEDC PWM directly: ESP32Servo 3.2.1 on
-// core 3.3 only outputs on one pin when several servos are attached.
+// Boards (no libraries needed on either):
+//   Raspberry Pi Pico / Pico 2: arduino-pico core (rp2040:rp2040:rpipico or rpipico2).
+//     Servo power from VBUS (pin 40), never 3V3.
+//   XIAO ESP32-S3: USB CDC On Boot: Enabled. Servo power from 5V, never 3V3.
+// Servos are driven with hardware PWM directly: ESP32Servo 3.2.1 on arduino-esp32
+// 3.3 only outputs on one pin when several servos are attached.
 
+#if defined(ARDUINO_ARCH_RP2040)
+#include <EEPROM.h>
+#include <hardware/clocks.h>
+#include <hardware/pwm.h>
+#include <hardware/watchdog.h>
+#if PICO_RP2350
+#include <hardware/structs/powman.h>
+#else
+#include <hardware/structs/vreg_and_chip_reset.h>
+#endif
+#elif defined(ARDUINO_ARCH_ESP32)
 #include <Preferences.h>
 #include <esp_system.h>
+#else
+#error "Unsupported board: use a Raspberry Pi Pico or an ESP32"
+#endif
 
 // ---- Axes ----
 enum AxisId { TILT, PAN, NUM_AXES };
@@ -33,18 +50,26 @@ struct ServoConfig {
   bool invert;   // mirrored mounting
 };
 
+#if defined(ARDUINO_ARCH_RP2040)
+const ServoConfig SERVOS[] = {
+  {3, TILT, false},  // GP3, physical pin 5
+  {4, TILT, true},   // GP4, physical pin 6
+  {2, PAN, false},   // GP2, physical pin 4
+};
+#else
 const ServoConfig SERVOS[] = {
   {D0, TILT, false},
   {D1, TILT, true},
   {D2, PAN, false},
 };
+#endif
 const int NUM_SERVOS = sizeof(SERVOS) / sizeof(SERVOS[0]);
 
 // SG90: 500..2400 us covers ~180 degrees.
 const int PULSE_MIN_US = 500;
 const int PULSE_MAX_US = 2400;
 const float SERVO_MIN_DEG = 2, SERVO_MAX_DEG = 178;  // never drive into the end stops
-const uint32_t PWM_HZ = 50, PWM_BITS = 14, PWM_PERIOD_US = 1000000 / PWM_HZ;
+const uint32_t PWM_HZ = 50, PWM_PERIOD_US = 1000000 / PWM_HZ;
 
 const float MAX_SPEED = 180;  // deg/s
 const float MAX_ACCEL = 720;  // deg/s^2
@@ -61,30 +86,115 @@ struct AxisState {
 };
 AxisState axes[NUM_AXES];
 float trims[NUM_SERVOS];  // degrees added per servo, loaded from flash
-Preferences prefs;
-
-RTC_NOINIT_ATTR uint32_t bootMagic;
-RTC_NOINIT_ATTR uint32_t bootCount;
+uint32_t bootCount;
+const char* resetReason;
 const uint32_t BOOT_MAGIC = 0x0DD0F01D;
-esp_reset_reason_t resetReason;
 
-const char* resetName(esp_reset_reason_t r) {
-  switch (r) {
-    case ESP_RST_POWERON:   return "POWERON";
-    case ESP_RST_EXT:       return "EXT";
-    case ESP_RST_SW:        return "SW";
-    case ESP_RST_PANIC:     return "PANIC";
-    case ESP_RST_INT_WDT:   return "INT_WDT";
-    case ESP_RST_TASK_WDT:  return "TASK_WDT";
-    case ESP_RST_WDT:       return "WDT";
-    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
-    case ESP_RST_BROWNOUT:  return "BROWNOUT";
-    case ESP_RST_SDIO:      return "SDIO";
-    case ESP_RST_USB:       return "USB";
-    case ESP_RST_JTAG:      return "JTAG";
-    default:                return "OTHER";
+// ---- Platform ----
+// Everything board-specific: PWM, reset reason, boot counter, trim storage.
+#if defined(ARDUINO_ARCH_RP2040)
+
+// Hardware PWM set up directly: analogWriteFreq() won't go below 100 Hz, which
+// halves every servo pulse. One count = 1 us, wrap at 20000 = 50 Hz.
+void pwmBegin() {}
+void pwmAttach(int pin) {
+  gpio_set_function(pin, GPIO_FUNC_PWM);
+  uint slice = pwm_gpio_to_slice_num(pin);
+  pwm_set_clkdiv(slice, clock_get_hz(clk_sys) / 1000000.0f);
+  pwm_set_wrap(slice, PWM_PERIOD_US - 1);
+  pwm_set_enabled(slice, true);
+}
+void pwmWriteUs(int pin, int us) { pwm_set_gpio_level(pin, us); }
+
+// Watchdog scratch registers survive every reset except power-on and RUN.
+// The RP2350 flags brownouts; on the RP2040 a brownout shows as POWERON.
+void readResetInfo() {
+#if PICO_RP2350
+  uint32_t cr = powman_hw->chip_reset;
+  bool cold = cr & (POWMAN_CHIP_RESET_HAD_POR_BITS | POWMAN_CHIP_RESET_HAD_BOR_BITS |
+                    POWMAN_CHIP_RESET_HAD_RUN_LOW_BITS);
+  if (cr & POWMAN_CHIP_RESET_HAD_BOR_BITS) resetReason = "BROWNOUT";
+  else if (cr & POWMAN_CHIP_RESET_HAD_POR_BITS) resetReason = "POWERON";
+  else if (cr & POWMAN_CHIP_RESET_HAD_RUN_LOW_BITS) resetReason = "EXT";
+#else
+  uint32_t cr = vreg_and_chip_reset_hw->chip_reset;
+  bool cold = cr & (VREG_AND_CHIP_RESET_CHIP_RESET_HAD_POR_BITS | VREG_AND_CHIP_RESET_CHIP_RESET_HAD_RUN_BITS);
+  if (cr & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_POR_BITS) resetReason = "POWERON";
+  else if (cr & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_RUN_BITS) resetReason = "EXT";
+#endif
+  else if (watchdog_caused_reboot()) resetReason = "SW";
+  else resetReason = "OTHER";
+  if (cold || watchdog_hw->scratch[0] != BOOT_MAGIC) {
+    watchdog_hw->scratch[0] = BOOT_MAGIC;
+    watchdog_hw->scratch[1] = 0;
+  }
+  bootCount = ++watchdog_hw->scratch[1];
+}
+
+struct TrimStore { uint32_t magic; float trims[NUM_SERVOS]; };
+void loadTrims() {
+  TrimStore t;
+  EEPROM.begin(256);
+  EEPROM.get(0, t);
+  for (int s = 0; s < NUM_SERVOS; s++) {
+    trims[s] = (t.magic == BOOT_MAGIC && isfinite(t.trims[s])) ? t.trims[s] : 0;
   }
 }
+void saveTrims() {
+  TrimStore t = {BOOT_MAGIC, {}};
+  for (int s = 0; s < NUM_SERVOS; s++) t.trims[s] = trims[s];
+  EEPROM.put(0, t);
+  EEPROM.commit();
+}
+
+#else  // ESP32
+
+const uint32_t PWM_BITS = 14;
+void pwmBegin() {}
+void pwmAttach(int pin) { ledcAttach(pin, PWM_HZ, PWM_BITS); }
+void pwmWriteUs(int pin, int us) {
+  ledcWrite(pin, (uint32_t)us * ((1 << PWM_BITS) - 1) / PWM_PERIOD_US);
+}
+
+RTC_NOINIT_ATTR uint32_t bootMagic;
+RTC_NOINIT_ATTR uint32_t rtcBootCount;
+void readResetInfo() {
+  esp_reset_reason_t r = esp_reset_reason();
+  switch (r) {
+    case ESP_RST_POWERON:   resetReason = "POWERON"; break;
+    case ESP_RST_EXT:       resetReason = "EXT"; break;
+    case ESP_RST_SW:        resetReason = "SW"; break;
+    case ESP_RST_PANIC:     resetReason = "PANIC"; break;
+    case ESP_RST_INT_WDT:   resetReason = "INT_WDT"; break;
+    case ESP_RST_TASK_WDT:  resetReason = "TASK_WDT"; break;
+    case ESP_RST_WDT:       resetReason = "WDT"; break;
+    case ESP_RST_DEEPSLEEP: resetReason = "DEEPSLEEP"; break;
+    case ESP_RST_BROWNOUT:  resetReason = "BROWNOUT"; break;
+    case ESP_RST_SDIO:      resetReason = "SDIO"; break;
+    case ESP_RST_USB:       resetReason = "USB"; break;
+    case ESP_RST_JTAG:      resetReason = "JTAG"; break;
+    default:                resetReason = "OTHER"; break;
+  }
+  if (r == ESP_RST_POWERON || bootMagic != BOOT_MAGIC) {
+    bootMagic = BOOT_MAGIC;
+    rtcBootCount = 0;
+  }
+  bootCount = ++rtcBootCount;
+}
+
+Preferences prefs;
+void loadTrims() {
+  prefs.begin("unhinged", true);
+  for (int s = 0; s < NUM_SERVOS; s++) trims[s] = prefs.getFloat(("trim" + String(s)).c_str(), 0);
+  prefs.end();
+}
+void saveTrims() {
+  prefs.begin("unhinged", false);
+  for (int s = 0; s < NUM_SERVOS; s++) prefs.putFloat(("trim" + String(s)).c_str(), trims[s]);
+  prefs.end();
+}
+
+#endif
 
 // ---- Output ----
 void sendHello() {
@@ -106,7 +216,7 @@ void sendPos() {
 
 void sendHeartbeat() {
   Serial.printf("hb up=%.1f boot=%lu reset=%s\n", millis() / 1000.0f,
-                (unsigned long)bootCount, resetName(resetReason));
+                (unsigned long)bootCount, resetReason);
 }
 
 // ---- Motion ----
@@ -115,7 +225,7 @@ void writeServo(int s) {
   float v = axes[c.axis].pos;
   float deg = constrain(90 + (c.invert ? -v : v) + trims[s], SERVO_MIN_DEG, SERVO_MAX_DEG);
   int us = PULSE_MIN_US + (int)((PULSE_MAX_US - PULSE_MIN_US) * deg / 180.0f + 0.5f);
-  ledcWrite(c.pin, (uint32_t)us * ((1 << PWM_BITS) - 1) / PWM_PERIOD_US);
+  pwmWriteUs(c.pin, us);
 }
 
 // Accelerate toward the fastest speed that can still stop exactly at the target.
@@ -143,18 +253,6 @@ void setTarget(AxisId axis, float deg) {
 }
 
 // ---- Trim ----
-void loadTrims() {
-  prefs.begin("unhinged", true);
-  for (int s = 0; s < NUM_SERVOS; s++) trims[s] = prefs.getFloat(("trim" + String(s)).c_str(), 0);
-  prefs.end();
-}
-
-void saveTrims() {
-  prefs.begin("unhinged", false);
-  for (int s = 0; s < NUM_SERVOS; s++) prefs.putFloat(("trim" + String(s)).c_str(), trims[s]);
-  prefs.end();
-}
-
 void sendTrims() {
   Serial.print("trim");
   for (int s = 0; s < NUM_SERVOS; s++) Serial.printf(" s%d=%.1f", s, trims[s]);
@@ -242,25 +340,20 @@ void pollSerial() {
 
 // ---- Main ----
 void setup() {
-  resetReason = esp_reset_reason();
-  if (resetReason == ESP_RST_POWERON || bootMagic != BOOT_MAGIC) {
-    bootMagic = BOOT_MAGIC;
-    bootCount = 0;
-  }
-  bootCount++;
-
+  readResetInfo();
   Serial.begin(115200);
 #if ARDUINO_USB_MODE
   Serial.setTxTimeoutMs(0);  // never stall motion if nobody is reading the port
 #endif
 
   loadTrims();
+  pwmBegin();
   // One axis at a time to spread the startup current, but every servo on an
   // axis starts in the same instant so linked servos never fight.
   for (int a = 0; a < NUM_AXES; a++) {
     for (int s = 0; s < NUM_SERVOS; s++) {
       if (SERVOS[s].axis != a) continue;
-      ledcAttach(SERVOS[s].pin, PWM_HZ, PWM_BITS);
+      pwmAttach(SERVOS[s].pin);
       writeServo(s);
     }
     delay(ATTACH_STAGGER_MS);
