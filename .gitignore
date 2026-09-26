@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python (Mac bridge, tools)
+.venv/
+__pycache__/
+*.pyc
+
+# Serial monitor session logs
+tools/logs/
+
+# Arduino build output
+build/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+*.xcscmblueprint
+.swiftpm/

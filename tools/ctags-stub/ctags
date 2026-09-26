@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stand-in for Arduino's Intel-only ctags on Macs without Rosetta.
+# Only safe because the sketches define functions before using them.
+exit 0
